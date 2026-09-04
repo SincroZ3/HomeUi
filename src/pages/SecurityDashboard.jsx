@@ -1,0 +1,1965 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import {
+  AlertTriangle,
+  Blinds,
+  ChevronRight,
+  Check,
+  Clock3,
+  Fingerprint,
+  House,
+  KeyRound,
+  Loader2,
+  Lock,
+  Moon,
+  Pencil,
+  Plane,
+  Search,
+  SlidersHorizontal,
+  Settings,
+  Shield,
+  ShieldOff,
+  ShieldPlus,
+  Unlock,
+  WifiOff,
+  X,
+} from 'lucide-react';
+import { clsx } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+import GlassDropdown from '../components/ui/GlassDropdown';
+import GlassModal from '../components/ui/GlassModal';
+import GlassSegmentSelect from '../components/ui/GlassSegmentSelect';
+import NestedPageHeader from '../components/ui/NestedPageHeader';
+import { CameraCardView } from '../components/widgets/CameraCardView';
+import { buildCameraCardModel } from '../components/widgets/cameraCardModel';
+import CameraViewer from '../components/camera/CameraViewer';
+import SecurityAuthModal from '../components/security/SecurityAuthModal';
+import { useDeviceAuth } from '../hooks/useDeviceAuth';
+import {
+  INITIAL_AUTH_ATTEMPT_STATE,
+  appendSecurityAuditEvent,
+  formatAuthRateLimitMessage,
+  getAuthRateLimitStatus,
+  recordAuthFailure,
+  recordAuthSuccess,
+} from '../services/securityAuth';
+import {
+  ALARM_FEATURE_ARM_AWAY,
+  ALARM_FEATURE_ARM_CUSTOM_BYPASS,
+  ALARM_FEATURE_ARM_HOME,
+  ALARM_FEATURE_ARM_NIGHT,
+  ALARM_FEATURE_ARM_VACATION,
+  ALARM_FEATURE_TRIGGER,
+  alarmSupportsFeature,
+  getAlarmStateLabel,
+  normalizeAlarmState,
+  resolveAlarmSupportedFeatures,
+} from '../utils/alarmUtils';
+import {
+  resolveAlarmManualCodeSubmission,
+  resolveAlarmSecurityRequirement,
+} from '../utils/alarmSecurityPolicy';
+
+const STORAGE_KEYS = {
+  alarmEntityId: 'ha.dashboard.security.alarmEntityId',
+  visibleSensorEntityIds: 'ha.dashboard.security.visibleSensorEntityIds',
+  visibleCameraEntityIds: 'ha.dashboard.security.visibleCameraEntityIds',
+};
+const LEGACY_SECURITY_ALARM_PIN_STORAGE_KEY = 'ha.dashboard.security.alarmPin';
+
+const UI_FLAGS = Object.freeze({
+  directCallWhenCodeNotRequired: false,
+  showSensorSearch: true,
+  showEventFeed: true,
+});
+
+const SECURITY_OVERVIEW_PATH = '/security';
+const SECURITY_CAMERAS_PATH = '/security/cameras';
+const SECURITY_SENSORS_PATH = '/security/sensors';
+const MAX_CAMERAS_ON_DASHBOARD = 4;
+const SECURITY_CAMERA_PREVIEW_REFRESH_MS = 10_000;
+const SHIELD_SIZE = 304;
+const SHIELD_PROGRESS_RADIUS = 146;
+const SHIELD_PROGRESS_CIRCUMFERENCE = 2 * Math.PI * SHIELD_PROGRESS_RADIUS;
+const SECURITY_SENSOR_DEVICE_CLASSES = new Set([
+  'door',
+  'window',
+  'opening',
+  'motion',
+  'presence',
+  'occupancy',
+  'vibration',
+  'tamper',
+  'smoke',
+  'gas',
+  'co',
+  'co2',
+  'heat',
+  'moisture',
+  'safety',
+  'problem',
+  'lock',
+  'garage_door',
+]);
+const SECURITY_SENSOR_KEYWORDS = [
+  'door',
+  'window',
+  'motion',
+  'presence',
+  'occupancy',
+  'pir',
+  'tamper',
+  'smoke',
+  'gas',
+  'co',
+  'alarm',
+  'allarme',
+  'intrusion',
+  'intrusione',
+  'perimetro',
+  'security',
+  'sicurezza',
+  'garage',
+  'porta',
+  'finestra',
+];
+
+const ALARM_MODE_OPTIONS = [
+  { value: 'armed_home', label: 'Casa', icon: House, feature: ALARM_FEATURE_ARM_HOME },
+  { value: 'armed_away', label: 'Fuori', icon: Plane, feature: ALARM_FEATURE_ARM_AWAY },
+  { value: 'armed_night', label: 'Notte', icon: Moon, feature: ALARM_FEATURE_ARM_NIGHT },
+  { value: 'armed_vacation', label: 'Vacanza', icon: Plane, feature: ALARM_FEATURE_ARM_VACATION },
+  { value: 'armed_custom_bypass', label: 'Bypass', icon: ShieldPlus, feature: ALARM_FEATURE_ARM_CUSTOM_BYPASS },
+];
+
+const ALARM_SERVICE_BY_STATE = {
+  disarmed: 'alarm_disarm',
+  armed_home: 'alarm_arm_home',
+  armed_away: 'alarm_arm_away',
+  armed_night: 'alarm_arm_night',
+  armed_vacation: 'alarm_arm_vacation',
+  armed_custom_bypass: 'alarm_arm_custom_bypass',
+  triggered: 'alarm_trigger',
+};
+
+const ALARM_ACTION_BY_STATE = {
+  disarmed: 'disarm',
+  armed_home: 'arm_home',
+  armed_away: 'arm_away',
+  armed_night: 'arm_night',
+  armed_vacation: 'arm_vacation',
+  armed_custom_bypass: 'arm_custom_bypass',
+  triggered: 'trigger',
+};
+
+const DEMO_SECURITY_LOGS = [
+  { id: 1, time: '14:20', message: 'Movimento rilevato', type: 'warning' },
+  { id: 2, time: '18:30', message: 'Allarme inserito', type: 'info' },
+];
+
+const ALARM_VISUALS = {
+  disarmed: {
+    icon: ShieldOff,
+    badge: 'Sistema Disinserito',
+    helper: 'Casa in standby',
+    backgroundColor: 'rgba(52,199,89,0.18)',
+    borderColor: 'rgba(52,199,89,0.52)',
+    boxShadow:
+      '0 0 0 1px rgba(52,199,89,0.35), 0 0 88px rgba(52,199,89,0.3), inset 0 0 80px rgba(52,199,89,0.18)',
+    pulseColor: 'rgba(52,199,89,0.65)',
+    ringColor: 'rgba(52,199,89,0.9)',
+    ringGlow: 'rgba(52,199,89,0.45)',
+  },
+  armed_home: {
+    icon: House,
+    badge: 'Inserito Casa',
+    helper: 'Perimetro attivo',
+    backgroundColor: 'rgba(255,59,48,0.2)',
+    borderColor: 'rgba(255,59,48,0.55)',
+    boxShadow:
+      '0 0 0 1px rgba(255,59,48,0.4), 0 0 96px rgba(255,59,48,0.35), inset 0 0 78px rgba(255,59,48,0.2)',
+    pulseColor: 'rgba(255,59,48,0.72)',
+    ringColor: 'rgba(255,59,48,0.92)',
+    ringGlow: 'rgba(255,59,48,0.46)',
+  },
+  armed_away: {
+    icon: Plane,
+    badge: 'Inserito Fuori',
+    helper: 'Protezione totale',
+    backgroundColor: 'rgba(255,59,48,0.24)',
+    borderColor: 'rgba(255,59,48,0.6)',
+    boxShadow:
+      '0 0 0 1px rgba(255,59,48,0.45), 0 0 106px rgba(255,59,48,0.4), inset 0 0 88px rgba(255,59,48,0.24)',
+    pulseColor: 'rgba(255,59,48,0.8)',
+    ringColor: 'rgba(255,59,48,0.94)',
+    ringGlow: 'rgba(255,59,48,0.5)',
+  },
+  armed_night: {
+    icon: Moon,
+    badge: 'Inserito Notte',
+    helper: 'Protezione notturna',
+    backgroundColor: 'rgba(88,86,214,0.24)',
+    borderColor: 'rgba(125,122,255,0.62)',
+    boxShadow:
+      '0 0 0 1px rgba(125,122,255,0.38), 0 0 92px rgba(88,86,214,0.34), inset 0 0 82px rgba(88,86,214,0.22)',
+    pulseColor: 'rgba(125,122,255,0.72)',
+    ringColor: 'rgba(155,153,255,0.96)',
+    ringGlow: 'rgba(125,122,255,0.5)',
+  },
+  armed_vacation: {
+    icon: Plane,
+    badge: 'Inserito Vacanza',
+    helper: 'Casa protetta durante l’assenza',
+    backgroundColor: 'rgba(0,122,255,0.22)',
+    borderColor: 'rgba(64,156,255,0.58)',
+    boxShadow:
+      '0 0 0 1px rgba(64,156,255,0.34), 0 0 94px rgba(0,122,255,0.32), inset 0 0 84px rgba(0,122,255,0.2)',
+    pulseColor: 'rgba(64,156,255,0.7)',
+    ringColor: 'rgba(100,180,255,0.96)',
+    ringGlow: 'rgba(64,156,255,0.48)',
+  },
+  armed_custom_bypass: {
+    icon: ShieldPlus,
+    badge: 'Inserito Bypass',
+    helper: 'Protezione personalizzata',
+    backgroundColor: 'rgba(255,159,10,0.22)',
+    borderColor: 'rgba(255,179,64,0.6)',
+    boxShadow:
+      '0 0 0 1px rgba(255,179,64,0.36), 0 0 94px rgba(255,159,10,0.32), inset 0 0 84px rgba(255,159,10,0.2)',
+    pulseColor: 'rgba(255,179,64,0.72)',
+    ringColor: 'rgba(255,195,92,0.98)',
+    ringGlow: 'rgba(255,179,64,0.48)',
+  },
+  triggered: {
+    icon: AlertTriangle,
+    badge: 'Allarme attivo',
+    helper: 'Richiede attenzione immediata',
+    backgroundColor: 'rgba(255,59,48,0.32)',
+    borderColor: 'rgba(255,105,97,0.8)',
+    boxShadow:
+      '0 0 0 1px rgba(255,105,97,0.52), 0 0 112px rgba(255,59,48,0.5), inset 0 0 92px rgba(255,59,48,0.28)',
+    pulseColor: 'rgba(255,105,97,0.9)',
+    ringColor: 'rgba(255,135,128,1)',
+    ringGlow: 'rgba(255,59,48,0.68)',
+  },
+  pending: {
+    icon: Loader2,
+    badge: 'Transizione in corso',
+    helper: 'Tempo di uscita/entrata',
+    backgroundColor: 'rgba(255,159,10,0.26)',
+    borderColor: 'rgba(255,159,10,0.62)',
+    boxShadow:
+      '0 0 0 1px rgba(255,159,10,0.4), 0 0 104px rgba(255,159,10,0.38), inset 0 0 92px rgba(255,159,10,0.24)',
+    pulseColor: 'rgba(255,159,10,0.8)',
+    ringColor: 'rgba(255,159,10,0.98)',
+    ringGlow: 'rgba(255,159,10,0.52)',
+  },
+  unavailable: {
+    icon: WifiOff,
+    badge: 'Non disponibile',
+    helper: 'Controlla la connessione a Home Assistant',
+    backgroundColor: 'rgba(142,142,147,0.16)',
+    borderColor: 'rgba(142,142,147,0.38)',
+    boxShadow: '0 0 0 1px rgba(142,142,147,0.2), inset 0 0 72px rgba(142,142,147,0.12)',
+    pulseColor: 'rgba(142,142,147,0.28)',
+    ringColor: 'rgba(174,174,178,0.7)',
+    ringGlow: 'rgba(142,142,147,0.25)',
+  },
+};
+
+function cn(...inputs) {
+  return twMerge(clsx(inputs));
+}
+
+function readStorageValue(key) {
+  if (typeof window === 'undefined') return '';
+  const raw = window.localStorage.getItem(key);
+  return typeof raw === 'string' ? raw : '';
+}
+
+function normalizeStoredEntityIds(values) {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values
+    .filter((value) => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean))];
+}
+
+function readStoredEntitySelection(key) {
+  if (typeof window === 'undefined') return null;
+  const raw = window.localStorage.getItem(key);
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      const legacyIds = normalizeStoredEntityIds(parsed);
+      // In the old format an empty list could be written while HA was still loading.
+      // Treat it as automatic discovery; future explicit empty selections use v2.
+      return legacyIds.length > 0 ? legacyIds : null;
+    }
+    if (parsed?.version === 2 && parsed?.mode === 'custom') {
+      return normalizeStoredEntityIds(parsed.ids);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredEntitySelection(key, ids) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(key, JSON.stringify({
+    version: 2,
+    mode: 'custom',
+    ids: normalizeStoredEntityIds(ids),
+  }));
+}
+
+function toItalianClockTime(date) {
+  return date.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+}
+
+function isBinarySensorOpen(value) {
+  const normalized = `${value ?? ''}`.trim().toLowerCase();
+  return normalized === 'on' || normalized === 'open' || normalized === 'detected' || normalized === 'true';
+}
+
+function resolveSensorFriendlyName(entityId, liveEntity) {
+  const friendlyName =
+    typeof liveEntity?.rawAttributes?.friendly_name === 'string' ? liveEntity.rawAttributes.friendly_name.trim() : '';
+  if (friendlyName) return friendlyName;
+  return (entityId.split('.').pop() ?? entityId)
+    .split('_')
+    .map((w) => (w ? `${w[0].toUpperCase()}${w.slice(1)}` : w))
+    .join(' ');
+}
+
+function resolveSensorType(entityId, liveEntity) {
+  const deviceClass = `${liveEntity?.rawAttributes?.device_class ?? ''}`.trim().toLowerCase();
+  const token = `${entityId} ${deviceClass}`.toLowerCase();
+  if (token.includes('door')) return 'door';
+  if (token.includes('window')) return 'window';
+  return 'sensor';
+}
+
+function isSecuritySensorEntity(entityId, liveEntity) {
+  const deviceClass = `${liveEntity?.rawAttributes?.device_class ?? ''}`.trim().toLowerCase();
+  if (SECURITY_SENSOR_DEVICE_CLASSES.has(deviceClass)) return true;
+  const friendlyName =
+    typeof liveEntity?.rawAttributes?.friendly_name === 'string' ? liveEntity.rawAttributes.friendly_name.trim() : '';
+  const token = `${entityId} ${friendlyName} ${deviceClass}`.toLowerCase();
+  return SECURITY_SENSOR_KEYWORDS.some((keyword) => token.includes(keyword));
+}
+
+function resolveCameraFriendlyName(entityId, liveEntity) {
+  const friendlyName =
+    typeof liveEntity?.rawAttributes?.friendly_name === 'string' ? liveEntity.rawAttributes.friendly_name.trim() : '';
+  if (friendlyName) return friendlyName;
+  return (entityId.split('.').pop() ?? entityId)
+    .split('_')
+    .map((w) => (w ? `${w[0].toUpperCase()}${w.slice(1)}` : w))
+    .join(' ');
+}
+
+function mapAlarmStateForShield(normalizedState, fallbackState) {
+  if (normalizedState === 'pending' || normalizedState === 'arming' || normalizedState === 'disarming') return 'pending';
+  if (ALARM_VISUALS[normalizedState]) return normalizedState;
+  if (normalizedState === 'unknown' || normalizedState === 'unavailable') return 'unavailable';
+  return fallbackState;
+}
+
+function toPositiveNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value.trim().replace(',', '.'));
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
+function resolveAlarmExitDelaySeconds(rawAttributes) {
+  if (!rawAttributes || typeof rawAttributes !== 'object') return null;
+  for (const key of ['delay_time', 'arming_time', 'exit_delay', 'pending_time', 'delay']) {
+    const parsed = toPositiveNumber(rawAttributes[key]);
+    if (parsed !== null) return Math.round(parsed);
+  }
+  return null;
+}
+
+function isSecurityCamerasNavigationTarget(path) {
+  const target = `${path ?? ''}`.trim();
+  if (!target) return false;
+
+  try {
+    const parsed = new URL(target, 'http://dashboard.local');
+    const pathname = parsed.pathname.toLowerCase();
+    const hash = parsed.hash.toLowerCase();
+    const view = (parsed.searchParams.get('view') ?? '').trim().toLowerCase();
+    const pathSegments = pathname.split('/').filter(Boolean);
+    const hashNormalized = hash.replace(/^#/, '').replace(/^\//, '');
+    const hashSegments = hashNormalized.split('/').filter(Boolean);
+    const isPathMatch =
+      pathSegments.includes('security') && (pathSegments.includes('cameras') || pathSegments.includes('telecamere'));
+    const isHashMatch =
+      hashSegments.includes('security') &&
+      (hashSegments.includes('cameras') || hashSegments.includes('telecamere'));
+    return (
+      isPathMatch ||
+      hash === '#security/cameras' ||
+      hash === '#security/telecamere' ||
+      isHashMatch ||
+      view === 'security-cameras' ||
+      view === 'security-telecamere'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function resolveSecurityCamerasFromLocation() {
+  if (typeof window === 'undefined') return false;
+  return isSecurityCamerasNavigationTarget(window.location.href);
+}
+
+function isSecuritySensorsNavigationTarget(path) {
+  const target = `${path ?? ''}`.trim();
+  if (!target) return false;
+
+  try {
+    const parsed = new URL(target, 'http://dashboard.local');
+    const pathname = parsed.pathname.toLowerCase();
+    const hash = parsed.hash.toLowerCase();
+    const view = (parsed.searchParams.get('view') ?? '').trim().toLowerCase();
+    const pathSegments = pathname.split('/').filter(Boolean);
+    const hashSegments = hash.replace(/^#/, '').replace(/^\//, '').split('/').filter(Boolean);
+    const containsSensors = (segments) => segments.includes('sensors') || segments.includes('sensori');
+    return (
+      (pathSegments.includes('security') && containsSensors(pathSegments)) ||
+      (hashSegments.includes('security') && containsSensors(hashSegments)) ||
+      hash === '#security/sensors' ||
+      hash === '#security/sensori' ||
+      view === 'security-sensors' ||
+      view === 'security-sensori'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function resolveSecuritySensorsFromLocation() {
+  if (typeof window === 'undefined') return false;
+  return isSecuritySensorsNavigationTarget(window.location.href);
+}
+
+// FeatureDetector (logica capability invariata)
+function resolveAlarmCodeFormat(rawAttributes) {
+  const raw = `${rawAttributes?.code_format ?? ''}`.trim().toLowerCase();
+  if (raw === 'number' || raw === 'numeric') return 'number';
+  if (raw === 'text' || raw === 'string') return 'text';
+  return null;
+}
+
+function sanitizeAlarmCode(value, codeFormat) {
+  const raw = `${value ?? ''}`;
+  if (codeFormat === 'number') return raw.replace(/[^\d]/g, '').slice(0, 16);
+  return raw.trim().slice(0, 48);
+}
+
+function isAlarmCodeRequiredForState(nextState, rawAttributes) {
+  const codeFormat = resolveAlarmCodeFormat(rawAttributes);
+  const codeArmRequired = rawAttributes?.code_arm_required === true;
+  const hasCodeCapability = Boolean(codeFormat) || codeArmRequired;
+  if (!hasCodeCapability) return false;
+  if (nextState === 'disarmed' || nextState === 'triggered') return true;
+  return codeArmRequired;
+}
+
+function resolveAlarmActionKind(nextState) {
+  return ALARM_ACTION_BY_STATE[nextState] ?? 'arm_away';
+}
+function SecurityMainShield({
+  visual,
+  statusLabel,
+  isTransitioning,
+  showDelayProgress,
+  delayProgress,
+  delayRemainingSeconds,
+  onPrimaryAction,
+  primaryActionLabel,
+  activeState,
+  onActionChange,
+  alarmOptions,
+  disabled,
+  commandFeedback,
+}) {
+  const Icon = visual.icon;
+  return (
+    <section className="dashboard-content-surface rounded-[26px] p-4 sm:rounded-[32px] sm:p-6">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="truncate text-xl font-semibold text-[color:var(--ui-text-primary)] sm:text-[1.45rem]">Hub Sicurezza</h2>
+        </div>
+        <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] sm:h-11 sm:w-11">
+          <Shield className="h-4 w-4 text-[color:var(--ui-text-secondary)]" />
+        </span>
+      </div>
+
+      <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] items-center gap-5 sm:mt-6">
+        <div className="flex items-center justify-center py-2">
+          <motion.button
+            type="button"
+            onClick={onPrimaryAction}
+            disabled={disabled}
+            whileTap={disabled ? undefined : { scale: 0.985 }}
+            className={cn(
+              'relative flex aspect-square w-[clamp(11.5rem,52vw,16.5rem)] items-center justify-center rounded-full border',
+              disabled ? 'cursor-not-allowed opacity-80' : 'cursor-pointer',
+            )}
+            animate={{ backgroundColor: visual.backgroundColor, borderColor: visual.borderColor, boxShadow: visual.boxShadow }}
+            transition={{ duration: 0.55, ease: [0.22, 1, 0.36, 1] }}
+            aria-label={`${statusLabel}. ${primaryActionLabel}`}
+          >
+            <motion.div
+              className="pointer-events-none absolute -inset-3 rounded-full sm:-inset-4"
+              animate={{ boxShadow: `0 0 0 2px ${visual.pulseColor}`, opacity: isTransitioning ? [0.2, 0.58, 0.22] : [0.08, 0.24, 0.08], scale: isTransitioning ? [1, 1.07, 1] : [1, 1.025, 1] }}
+              transition={{ duration: isTransitioning ? 2.8 : 4.2, repeat: Number.POSITIVE_INFINITY, ease: 'easeInOut' }}
+            />
+            {showDelayProgress ? (
+              <svg className="pointer-events-none absolute inset-0 h-full w-full -rotate-90" viewBox={`0 0 ${SHIELD_SIZE} ${SHIELD_SIZE}`} fill="none">
+                <circle cx={SHIELD_SIZE / 2} cy={SHIELD_SIZE / 2} r={SHIELD_PROGRESS_RADIUS} stroke="rgba(255,255,255,0.2)" strokeWidth="4.5" />
+                <motion.circle
+                  cx={SHIELD_SIZE / 2}
+                  cy={SHIELD_SIZE / 2}
+                  r={SHIELD_PROGRESS_RADIUS}
+                  stroke={visual.ringColor}
+                  strokeWidth="4.5"
+                  strokeLinecap="round"
+                  strokeDasharray={SHIELD_PROGRESS_CIRCUMFERENCE}
+                  animate={{ strokeDashoffset: SHIELD_PROGRESS_CIRCUMFERENCE * (1 - delayProgress) }}
+                  transition={{ duration: 0.2, ease: 'linear' }}
+                  style={{ filter: `drop-shadow(0 0 10px ${visual.ringGlow})` }}
+                />
+              </svg>
+            ) : null}
+            <div className="relative z-10 flex max-w-[80%] flex-col items-center text-center">
+              <Icon className={cn('h-12 w-12 text-[color:var(--ui-text-primary)] sm:h-14 sm:w-14', isTransitioning ? 'animate-spin' : '')} />
+              <p className="mt-4 text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--ui-text-primary)] sm:text-xs">{statusLabel}</p>
+              <p className="mt-1.5 text-[11px] leading-snug text-[color:var(--ui-text-secondary)] sm:text-xs">{visual.helper}</p>
+              {showDelayProgress ? <p className="mt-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-[color:var(--ui-text-secondary)]">Uscita in {delayRemainingSeconds}s</p> : null}
+            </div>
+          </motion.button>
+        </div>
+
+        <div className="min-w-0">
+          <GlassSegmentSelect
+            ariaLabel="Modalità allarme"
+            options={alarmOptions.map((option) => {
+              const OptionIcon = option.icon;
+              return {
+                value: option.value,
+                label: <OptionIcon className="h-4 w-4" />,
+                ariaLabel: option.label,
+                title: option.label,
+              };
+            })}
+            value={alarmOptions.some((option) => option.value === activeState) ? activeState : undefined}
+            onChange={onActionChange}
+            disabled={disabled}
+            minOptionWidth="2.8rem"
+            scrollable
+            optionClassName="h-10 px-2 sm:h-11 sm:px-3"
+          />
+
+          {commandFeedback ? (
+            <p className="mt-3 rounded-xl border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] px-3 py-2 text-xs text-[color:var(--ui-text-secondary)]" role="status">
+              {commandFeedback}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SecurityEntityPickerModal({
+  isOpen,
+  title,
+  description,
+  entities,
+  selectedEntityIds,
+  onToggleEntity,
+  onSelectAll,
+  onSelectNone,
+  onClose,
+}) {
+  const [query, setQuery] = useState('');
+
+  useEffect(() => {
+    if (isOpen) setQuery('');
+  }, [isOpen]);
+
+  const filteredEntities = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return entities;
+    return entities.filter((entry) => `${entry.name} ${entry.entityId}`.toLowerCase().includes(normalized));
+  }, [entities, query]);
+
+  const selectedSet = useMemo(() => new Set(selectedEntityIds), [selectedEntityIds]);
+
+  return (
+    <GlassModal
+      isOpen={isOpen}
+      onClose={onClose}
+      eyebrow="Modalità Edit"
+      title={title}
+      description={description}
+      variant="responsive"
+      size="xl"
+      zIndex={290}
+      closeLabel="Chiudi selezione dispositivi"
+      backdropClassName="bg-white/[0.02] backdrop-blur-2xl"
+      bodyClassName="flex flex-col overflow-hidden"
+    >
+            <div className="liquid-glass-card mt-4 px-4 py-3">
+              <label className="flex items-center gap-3">
+                <span className="inline-flex rounded-full border border-white/10 bg-white/10 p-2"><Search className="h-3.5 w-3.5 text-white/75" /></span>
+                <input value={query} onChange={(event) => setQuery(event.target.value)} className="w-full bg-transparent text-sm text-white placeholder:text-white/45 outline-none" placeholder="Cerca dispositivo per nome o entity_id" />
+              </label>
+            </div>
+
+            <div className="mt-4 flex items-center justify-between gap-2">
+              <p className="text-xs text-white/60">
+                Selezionati: <span className="font-semibold text-white">{selectedEntityIds.length}</span> / {entities.length}
+              </p>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={onSelectAll} className="rounded-full border border-white/15 bg-white/[0.08] px-3 py-1 text-xs font-semibold text-white/85 hover:bg-white/[0.14]">
+                  Tutti
+                </button>
+                <button type="button" onClick={onSelectNone} className="rounded-full border border-white/15 bg-white/[0.08] px-3 py-1 text-xs font-semibold text-white/85 hover:bg-white/[0.14]">
+                  Nessuno
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-3 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1 custom-scrollbar">
+              {filteredEntities.length > 0 ? (
+                filteredEntities.map((entry) => {
+                  const checked = selectedSet.has(entry.entityId);
+                  return (
+                    <button
+                      key={entry.entityId}
+                      type="button"
+                      onClick={() => onToggleEntity(entry.entityId)}
+                      className={cn(
+                        'w-full rounded-2xl border px-3 py-2.5 text-left transition-colors',
+                        checked ? 'border-white/25 bg-white/[0.12]' : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.08]',
+                      )}
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className={cn('inline-flex h-5 w-5 items-center justify-center rounded-md border', checked ? 'border-emerald-300/70 bg-emerald-400/20 text-emerald-100' : 'border-white/20 bg-white/[0.04] text-transparent')}>
+                          <Check className="h-3.5 w-3.5" />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-semibold text-white">{entry.name}</p>
+                          <p className="truncate text-[11px] font-light text-white/50">{entry.entityId}</p>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-white/55">
+                  Nessun dispositivo trovato.
+                </div>
+              )}
+            </div>
+    </GlassModal>
+  );
+}
+
+function SecuritySensorRows({ sensors, limitOnMobile = false }) {
+  const getIcon = (type) => (type === 'door' ? House : Blinds);
+
+  if (sensors.length === 0) {
+    return <div className="dashboard-content-surface-soft rounded-2xl px-4 py-3 text-sm text-[color:var(--ui-text-secondary)]">Nessun sensore disponibile.</div>;
+  }
+
+  return sensors.map((sensor, index) => {
+    const Icon = getIcon(sensor.type);
+    return (
+      <div
+        key={sensor.entityId}
+        className={cn(
+          'dashboard-content-surface-soft rounded-2xl px-4 py-3',
+          sensor.isOpen ? 'border-[#FF3B30]/40 bg-[#FF3B30]/12' : '',
+          limitOnMobile && index >= 5 ? 'hidden sm:block' : '',
+        )}
+      >
+        <div className="flex items-center gap-3">
+          <span className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)]"><Icon className="h-4.5 w-4.5 text-[color:var(--ui-text-secondary)]" /></span>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-semibold text-[color:var(--ui-text-primary)]">{sensor.name}</p>
+            <p className="truncate text-[11px] font-light text-[color:var(--ui-text-tertiary)]">{sensor.entityId}</p>
+          </div>
+          <span className={cn('inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold', sensor.isOpen ? 'border-[#FF3B30]/45 bg-[#FF3B30]/20 text-[#FFD2CF]' : 'border-[#34C759]/45 bg-[#34C759]/18 text-[#CDF9D8]')}>
+            {sensor.isOpen ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+            {sensor.isOpen ? 'Aperto' : 'Chiuso'}
+          </span>
+        </div>
+      </div>
+    );
+  });
+}
+
+function SensorSearchField({ query, onQueryChange }) {
+  return (
+    <div className="dashboard-content-surface-soft rounded-2xl px-4 py-3">
+      <label className="flex items-center gap-3">
+        <span className="inline-flex rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] p-2"><Search className="h-3.5 w-3.5 text-[color:var(--ui-text-secondary)]" /></span>
+        <input value={query} onChange={(event) => onQueryChange(event.target.value)} className="w-full bg-transparent text-sm text-[color:var(--ui-text-primary)] placeholder:text-[color:var(--ui-text-tertiary)] outline-none" placeholder="Cerca sensore per nome o entity_id" />
+      </label>
+    </div>
+  );
+}
+
+function SecuritySensorList({ sensors, query, onQueryChange, isEditMode = false, selectedCount = 0, totalCount = 0, onOpenSelector, onOpenAll }) {
+  const hiddenOnMobileCount = Math.max(0, sensors.length - 5);
+  return (
+    <section className="dashboard-content-surface rounded-[26px] p-4 sm:rounded-[32px] sm:p-6">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            {isEditMode ? (
+              <h3 className="inline-flex min-w-0 items-center gap-2 text-xl font-semibold text-[color:var(--ui-text-primary)]">Perimetro <Lock className="h-4 w-4 shrink-0 text-[color:var(--ui-text-tertiary)]" /></h3>
+            ) : (
+              <button type="button" onClick={onOpenAll} className="inline-flex min-h-8 min-w-0 items-center gap-1 text-left text-xl font-semibold text-[color:var(--ui-text-primary)] transition-colors hover:text-[color:var(--ui-text-secondary)]">
+                Perimetro
+                <ChevronRight className="h-4 w-4 shrink-0 text-[color:var(--ui-text-secondary)]" />
+              </button>
+            )}
+          </div>
+          <p className="mt-1 truncate text-xs text-[color:var(--ui-text-secondary)]">Porte, finestre e rilevatori</p>
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <span className="inline-flex shrink-0 rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] px-2.5 py-1 text-[11px] font-semibold text-[color:var(--ui-text-secondary)]">
+            {isEditMode ? `${selectedCount}/${totalCount}` : sensors.length}
+          </span>
+          {isEditMode ? (
+            <button type="button" onClick={onOpenSelector} className="glass-button min-h-11 rounded-full px-3 text-xs font-semibold">
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              Seleziona
+            </button>
+          ) : null}
+          {!isEditMode && hiddenOnMobileCount > 0 ? (
+            <button type="button" onClick={onOpenAll} className="glass-button min-h-11 rounded-full px-3 text-xs font-semibold sm:hidden">
+              +{hiddenOnMobileCount} altri
+            </button>
+          ) : null}
+        </div>
+      </div>
+      {UI_FLAGS.showSensorSearch ? (
+        <div className="mt-4"><SensorSearchField query={query} onQueryChange={onQueryChange} /></div>
+      ) : null}
+      <div className="mt-4 grid max-h-none grid-cols-[repeat(auto-fit,minmax(min(100%,15rem),1fr))] gap-2.5 overflow-visible pr-0 sm:max-h-[28rem] sm:overflow-y-auto sm:pr-1 custom-scrollbar">
+        <SecuritySensorRows sensors={sensors} limitOnMobile />
+      </div>
+    </section>
+  );
+}
+
+function SecuritySensorDirectoryPage({ sensors, query, onQueryChange, onBackToOverview, scrollContainerRef }) {
+  return (
+    <section className="dashboard-content-surface min-h-full rounded-none border-0 bg-transparent">
+      <NestedPageHeader
+        title="Sensori del perimetro"
+        subtitle="Porte, finestre e rilevatori della casa"
+        onBack={onBackToOverview}
+        scrollContainerRef={scrollContainerRef}
+        trailing={<span className="inline-flex shrink-0 rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] px-2.5 py-1 text-[11px] font-semibold text-[color:var(--ui-text-secondary)]">{sensors.length}</span>}
+      />
+      <div className="px-4 py-5 pb-[calc(env(safe-area-inset-bottom)+1.25rem)] sm:px-8 sm:py-6">
+        {UI_FLAGS.showSensorSearch ? <SensorSearchField query={query} onQueryChange={onQueryChange} /> : null}
+        <div className="mt-4 grid min-h-0 grid-cols-1 content-start gap-2.5 overflow-y-auto pr-1 custom-scrollbar sm:grid-cols-2">
+          <SecuritySensorRows sensors={sensors} />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SecurityCameraSection({
+  cameras,
+  previewLimit = MAX_CAMERAS_ON_DASHBOARD,
+  isDedicatedPage = false,
+  isEditMode = false,
+  selectedCount = 0,
+  totalCount = 0,
+  onOpenSelector,
+  onOpenAll,
+  onOpenCamera,
+  onBackToOverview,
+  scrollContainerRef,
+}) {
+  const visibleCameras = isDedicatedPage ? cameras : cameras.slice(0, previewLimit);
+  const hiddenCount = Math.max(0, cameras.length - visibleCameras.length);
+
+  return (
+    <section
+      className={cn(
+        'dashboard-content-surface',
+        isDedicatedPage ? 'min-h-full rounded-none border-0 bg-transparent' : 'rounded-[26px] p-4 sm:rounded-[32px] sm:p-6',
+      )}
+    >
+      {isDedicatedPage ? (
+        <NestedPageHeader
+          title="Telecamere"
+          subtitle="Tutte le videocamere della casa"
+          onBack={onBackToOverview}
+          scrollContainerRef={scrollContainerRef}
+          trailing={<span className="inline-flex shrink-0 rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] px-2.5 py-1 text-[11px] font-semibold text-[color:var(--ui-text-secondary)]">{cameras.length}</span>}
+        />
+      ) : (
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          {isEditMode ? (
+            <>
+              <h3 className="inline-flex items-center gap-2 text-left text-xl font-semibold text-[color:var(--ui-text-primary)]">
+                Telecamere
+                <Lock className="h-4 w-4 text-[color:var(--ui-text-tertiary)]" />
+              </h3>
+              <p className="mt-1 truncate text-xs text-[color:var(--ui-text-secondary)]">Anteprime e stato della videosorveglianza</p>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenAll}
+              className="inline-flex min-h-8 items-center gap-1 text-left text-xl font-semibold text-[color:var(--ui-text-primary)] transition-colors hover:text-[color:var(--ui-text-secondary)]"
+            >
+              Telecamere
+              <ChevronRight className="h-4 w-4 text-[color:var(--ui-text-secondary)]" />
+            </button>
+          )}
+          {!isEditMode ? <p className="mt-1 truncate text-xs text-[color:var(--ui-text-secondary)]">Anteprime e stato della videosorveglianza</p> : null}
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <span className="inline-flex shrink-0 rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] px-2.5 py-1 text-[11px] font-semibold text-[color:var(--ui-text-secondary)]">
+            {isEditMode ? `${selectedCount}/${totalCount}` : cameras.length}
+          </span>
+          {isEditMode ? (
+            <button
+              type="button"
+              onClick={onOpenSelector}
+              className="glass-button min-h-11 rounded-full px-3 text-xs font-semibold"
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              Seleziona
+            </button>
+          ) : null}
+          {hiddenCount > 0 ? (
+            <button
+              type="button"
+              onClick={isEditMode ? onOpenSelector : onOpenAll}
+              className="glass-button min-h-11 rounded-full px-3 text-xs font-semibold"
+            >
+              {isEditMode ? `+${hiddenCount} escluse` : `+${hiddenCount} altre`}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      )}
+
+      <div className={cn('pr-0 sm:pr-1 custom-scrollbar', isDedicatedPage ? 'overflow-visible px-4 py-5 pb-[calc(env(safe-area-inset-bottom)+1.25rem)] sm:px-8 sm:py-6' : 'mt-4 max-h-none overflow-visible sm:max-h-[28rem] sm:overflow-y-auto')}>
+        {visibleCameras.length > 0 ? (
+          <div
+            className={cn(
+              'grid grid-cols-2 gap-3',
+              isDedicatedPage && 'lg:grid-cols-3 2xl:grid-cols-4',
+            )}
+          >
+            {visibleCameras.map((camera) => (
+              <div
+                key={camera.entityId}
+                className="aspect-video min-w-0 overflow-hidden rounded-[1.35rem]"
+              >
+                <CameraCardView
+                  model={camera.model}
+                  layoutVariant="compact"
+                  isSelected={false}
+                  isEditMode={isEditMode}
+                  onOpen={!isEditMode && onOpenCamera ? () => onOpenCamera(camera.entityId) : undefined}
+                  preferStream={false}
+                  snapshotRefreshIntervalMs={SECURITY_CAMERA_PREVIEW_REFRESH_MS}
+                  imageLoading="lazy"
+                />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="dashboard-content-surface-soft rounded-2xl px-4 py-3 text-sm text-[color:var(--ui-text-secondary)]">
+            Nessuna telecamera `camera.*` trovata.
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+export function SecurityDashboard({
+  isEditMode = false,
+  canManageSecurity = false,
+  runtimeMode = 'real',
+  suppressBrowserNavigation = false,
+  navigationRoute = '',
+  haConnected = false,
+  haStates = {},
+  alarmEntityOptions = [],
+  alarmSecurityProfiles = [],
+  sensorEntityOptions = [],
+  cameraEntityOptions = [],
+  cameraPtzEntityIds = [],
+  deviceAuthUser = null,
+  onCallService,
+  onCameraPtzMove,
+  onCameraPtzStop,
+}) {
+  const [logs, setLogs] = useState(() => (runtimeMode === 'demo' ? DEMO_SECURITY_LOGS : []));
+  const logsRuntimeRef = useRef(runtimeMode);
+  const [sensorSearchQuery, setSensorSearchQuery] = useState('');
+  const [selectedAlarmEntityId, setSelectedAlarmEntityId] = useState(() => readStorageValue(STORAGE_KEYS.alarmEntityId));
+  const [biometricAvailable, setBiometricAvailable] = useState(false);
+  const [biometricAvailabilityResolved, setBiometricAvailabilityResolved] = useState(false);
+  const [biometricStatus, setBiometricStatus] = useState('Verifica biometria in corso...');
+  const [biometricMessage, setBiometricMessage] = useState('');
+  const [isBiometricBusy, setIsBiometricBusy] = useState(false);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [pendingAlarmState, setPendingAlarmState] = useState(null);
+  const [authPinInput, setAuthPinInput] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [isAuthBusy, setIsAuthBusy] = useState(false);
+  const [authAttemptState, setAuthAttemptState] = useState(INITIAL_AUTH_ATTEMPT_STATE);
+  const [pendingCommand, setPendingCommand] = useState(null);
+  const [commandFeedback, setCommandFeedback] = useState('');
+  const [dangerActionState, setDangerActionState] = useState(null);
+  const [armingDelayTotalMs, setArmingDelayTotalMs] = useState(0);
+  const [armingDelayEndAtMs, setArmingDelayEndAtMs] = useState(null);
+  const [armingDelayNowMs, setArmingDelayNowMs] = useState(() => Date.now());
+  const [armingTargetState, setArmingTargetState] = useState(null);
+  const [isCameraDirectoryView, setIsCameraDirectoryView] = useState(() => resolveSecurityCamerasFromLocation());
+  const [isSensorDirectoryView, setIsSensorDirectoryView] = useState(() => resolveSecuritySensorsFromLocation());
+
+  useEffect(() => {
+    if (logsRuntimeRef.current === runtimeMode) return;
+    logsRuntimeRef.current = runtimeMode;
+    setLogs(runtimeMode === 'demo' ? DEMO_SECURITY_LOGS : []);
+  }, [runtimeMode]);
+  const [visibleSensorEntityIds, setVisibleSensorEntityIds] = useState(() => readStoredEntitySelection(STORAGE_KEYS.visibleSensorEntityIds));
+  const [visibleCameraEntityIds, setVisibleCameraEntityIds] = useState(() => readStoredEntitySelection(STORAGE_KEYS.visibleCameraEntityIds));
+  const [activeCameraEntityId, setActiveCameraEntityId] = useState(null);
+  const [isSensorSelectorOpen, setIsSensorSelectorOpen] = useState(false);
+  const [isCameraSelectorOpen, setIsCameraSelectorOpen] = useState(false);
+  const [isMobileSecurityEditMode, setIsMobileSecurityEditMode] = useState(false);
+  const alarmCommandContextRef = useRef({ available: false, entityId: '' });
+  const authSessionActiveRef = useRef(false);
+  const securityDirectoryScrollRef = useRef(null);
+  const deviceAuth = useDeviceAuth(deviceAuthUser ?? {
+    id: selectedAlarmEntityId || 'security_dashboard',
+    name: 'security_dashboard',
+    displayName: 'Security Dashboard',
+  });
+  const effectiveSecurityEditMode = canManageSecurity && (isEditMode || isMobileSecurityEditMode);
+
+  const availableAlarmEntities = useMemo(
+    () => (alarmEntityOptions.length > 0 ? [...new Set(alarmEntityOptions)] : Object.keys(haStates).filter((id) => id.startsWith('alarm_control_panel.'))).sort((a, b) => a.localeCompare(b, 'it-IT')),
+    [alarmEntityOptions, haStates],
+  );
+  const alarmDropdownOptions = useMemo(
+    () =>
+      availableAlarmEntities.map((entityId) => ({
+        id: entityId,
+        name: `${haStates[entityId]?.rawAttributes?.friendly_name ?? ''}`.trim() || entityId,
+      })),
+    [availableAlarmEntities, haStates],
+  );
+
+  const availableSensorEntities = useMemo(
+    () => (sensorEntityOptions.length > 0 ? [...new Set(sensorEntityOptions)] : Object.keys(haStates).filter((id) => id.startsWith('binary_sensor.'))).sort((a, b) => a.localeCompare(b, 'it-IT')),
+    [haStates, sensorEntityOptions],
+  );
+
+  const availableSecuritySensorEntities = useMemo(() => {
+    const securityEntities = availableSensorEntities.filter((entityId) => isSecuritySensorEntity(entityId, haStates[entityId]));
+    // Integrations without a device_class must remain usable: if classification
+    // finds nothing, expose the binary sensors instead of rendering an empty page.
+    return securityEntities.length > 0 ? securityEntities : availableSensorEntities;
+  },
+    [availableSensorEntities, haStates],
+  );
+
+  const availableCameraEntities = useMemo(
+    () => [...new Set([
+      ...cameraEntityOptions,
+      ...Object.keys(haStates).filter((id) => id.startsWith('camera.')),
+    ])].filter((id) => id.startsWith('camera.')).sort((a, b) => a.localeCompare(b, 'it-IT')),
+    [cameraEntityOptions, haStates],
+  );
+
+  const selectedSensorEntityIds = useMemo(
+    () => {
+      if (visibleSensorEntityIds === null) return availableSecuritySensorEntities;
+      const availableIds = new Set(availableSecuritySensorEntities);
+      return visibleSensorEntityIds.filter((entityId) => availableIds.has(entityId));
+    },
+    [availableSecuritySensorEntities, visibleSensorEntityIds],
+  );
+
+  const selectedCameraEntityIds = useMemo(
+    () => {
+      if (visibleCameraEntityIds === null) return availableCameraEntities;
+      const availableIds = new Set(availableCameraEntities);
+      return visibleCameraEntityIds.filter((entityId) => availableIds.has(entityId));
+    },
+    [availableCameraEntities, visibleCameraEntityIds],
+  );
+
+  const sensors = useMemo(
+    () => selectedSensorEntityIds.map((entityId) => ({
+      entityId,
+      name: resolveSensorFriendlyName(entityId, haStates[entityId]),
+      type: resolveSensorType(entityId, haStates[entityId]),
+      isOpen: isBinarySensorOpen(haStates[entityId]?.state),
+    })),
+    [selectedSensorEntityIds, haStates],
+  );
+
+  const filteredSensors = useMemo(() => {
+    const q = sensorSearchQuery.trim().toLowerCase();
+    if (!q) return sensors;
+    return sensors.filter((s) => `${s.name}`.toLowerCase().includes(q) || `${s.entityId}`.toLowerCase().includes(q));
+  }, [sensorSearchQuery, sensors]);
+
+  const cameras = useMemo(
+    () =>
+      selectedCameraEntityIds.map((entityId) => {
+        const liveEntity = haStates[entityId];
+        const name = resolveCameraFriendlyName(entityId, liveEntity);
+        const model = buildCameraCardModel({
+          id: `security-camera-${entityId}`,
+          kind: 'camera',
+          title: name,
+          entityId,
+          status: liveEntity ? `${liveEntity.state ?? ''}` : 'unavailable',
+        }, liveEntity);
+        return {
+          entityId,
+          model,
+          viewerItem: {
+            entityId,
+            name: model.title,
+            statusLabel: model.statusLabel,
+            subtitle: model.subtitle,
+            streamUrl: model.streamUrl,
+            snapshotUrl: model.imageUrl,
+            isOffline: !model.isAvailable,
+            supportsPtz: cameraPtzEntityIds.includes(entityId),
+          },
+        };
+      }),
+    [cameraPtzEntityIds, selectedCameraEntityIds, haStates],
+  );
+  const activeCamera = useMemo(
+    () => cameras.find((camera) => camera.entityId === activeCameraEntityId) ?? null,
+    [activeCameraEntityId, cameras],
+  );
+
+  const sensorSelectionOptions = useMemo(
+    () =>
+      availableSecuritySensorEntities.map((entityId) => ({
+        entityId,
+        name: resolveSensorFriendlyName(entityId, haStates[entityId]),
+      })),
+    [availableSecuritySensorEntities, haStates],
+  );
+
+  const cameraSelectionOptions = useMemo(
+    () =>
+      availableCameraEntities.map((entityId) => ({
+        entityId,
+        name: resolveCameraFriendlyName(entityId, haStates[entityId]),
+      })),
+    [availableCameraEntities, haStates],
+  );
+
+  const activeAlarmEntity = selectedAlarmEntityId ? haStates[selectedAlarmEntityId] : undefined;
+  const activeAlarmAttributes = activeAlarmEntity?.rawAttributes;
+  const activeAlarmSecurityProfile = alarmSecurityProfiles.find(
+    (profile) => profile?.entityId === selectedAlarmEntityId,
+  ) ?? null;
+  const storedAlarmCode = `${activeAlarmSecurityProfile?.unlockCode ?? ''}`.trim();
+  const localExtraCode = `${activeAlarmSecurityProfile?.localExtraCode ?? ''}`.trim();
+  const requireDeviceConfirmation = activeAlarmSecurityProfile?.requireDeviceConfirmation === true;
+  const alarmCodeFormat = resolveAlarmCodeFormat(activeAlarmAttributes);
+  const alarmCodeArmRequired = activeAlarmAttributes?.code_arm_required === true;
+  const alarmHasCodeCapability = Boolean(alarmCodeFormat) || alarmCodeArmRequired;
+  const alarmCodeTypeLabel = alarmCodeFormat === 'text' ? 'Codice' : 'PIN';
+  const isAlarmCodeNumeric = alarmCodeFormat === 'number';
+  const normalizedLiveAlarmState = normalizeAlarmState(activeAlarmEntity?.state ?? activeAlarmEntity?.stateLabel);
+  const supportedAlarmFeatures = resolveAlarmSupportedFeatures(activeAlarmEntity);
+  const hasSupportedFeatureMask = typeof supportedAlarmFeatures === 'number' && Number.isFinite(supportedAlarmFeatures);
+  const supportedAlarmModes = useMemo(
+    () =>
+      hasSupportedFeatureMask
+        ? ALARM_MODE_OPTIONS.filter((option) => alarmSupportsFeature(supportedAlarmFeatures, option.feature))
+        : ALARM_MODE_OPTIONS.filter((option) => ['armed_home', 'armed_away', 'armed_night'].includes(option.value)),
+    [hasSupportedFeatureMask, supportedAlarmFeatures],
+  );
+  const alarmOptions = useMemo(
+    () => [{ value: 'disarmed', label: 'Disinserisci', icon: ShieldOff }, ...supportedAlarmModes],
+    [supportedAlarmModes],
+  );
+  const triggerSupported = hasSupportedFeatureMask && alarmSupportsFeature(supportedAlarmFeatures, ALARM_FEATURE_TRIGGER);
+  const alarmEntityAvailable =
+    runtimeMode === 'real' &&
+    haConnected &&
+    Boolean(activeAlarmEntity) &&
+    !['unknown', 'unavailable'].includes(normalizedLiveAlarmState);
+  const alarmCommandsAvailable = !effectiveSecurityEditMode && alarmEntityAvailable && typeof onCallService === 'function';
+  alarmCommandContextRef.current = { available: alarmCommandsAvailable, entityId: selectedAlarmEntityId };
+
+  const isLiveAlarmTransitioning = ['pending', 'arming', 'disarming'].includes(normalizedLiveAlarmState);
+  const baseResolvedShieldState = haConnected && activeAlarmEntity
+    ? mapAlarmStateForShield(normalizedLiveAlarmState, 'unavailable')
+    : 'unavailable';
+
+  const remainingDelayMs = armingDelayEndAtMs ? Math.max(0, armingDelayEndAtMs - armingDelayNowMs) : 0;
+  const hasActiveArmingDelay = armingDelayTotalMs > 0 && remainingDelayMs > 0;
+  const delayProgress = hasActiveArmingDelay ? Math.min(1, Math.max(0, 1 - remainingDelayMs / armingDelayTotalMs)) : 0;
+  const delayRemainingSeconds = hasActiveArmingDelay ? Math.max(0, Math.ceil(remainingDelayMs / 1000)) : 0;
+  const resolvedShieldState = hasActiveArmingDelay && baseResolvedShieldState !== 'pending' ? 'pending' : baseResolvedShieldState;
+
+  const currentVisual = ALARM_VISUALS[resolvedShieldState] ?? ALARM_VISUALS.unavailable;
+  const alarmStatusLabel = hasActiveArmingDelay ? 'Inserimento in corso' : haConnected && activeAlarmEntity ? getAlarmStateLabel(normalizedLiveAlarmState) : currentVisual.badge;
+  const isAlarmTransitioning = (haConnected && activeAlarmEntity && isLiveAlarmTransitioning) || resolvedShieldState === 'pending' || hasActiveArmingDelay || Boolean(pendingCommand);
+
+  const pendingStateRequiresCode = pendingAlarmState ? isAlarmCodeRequiredForState(pendingAlarmState, activeAlarmAttributes) : false;
+  const pendingSecurityRequirement = pendingAlarmState
+    ? resolveAlarmSecurityRequirement({
+        action: resolveAlarmActionKind(pendingAlarmState),
+        codeArmRequired: alarmCodeArmRequired,
+        codeFormat: alarmCodeFormat,
+        storedHaPinConfigured: storedAlarmCode.length > 0,
+        localExtraPinConfigured: localExtraCode.length > 0,
+        deviceAuthEnabled: requireDeviceConfirmation,
+      })
+    : null;
+  const pendingAuthRequiresCode = pendingSecurityRequirement?.needsCodeInput ?? pendingStateRequiresCode;
+  const pendingPrefersDeviceAuth = Boolean(
+    pendingSecurityRequirement?.allowsDeviceAuth && biometricAvailable && deviceAuth.isEnrolled,
+  );
+  const authRateLimitStatus = getAuthRateLimitStatus(authAttemptState);
+  const authRateLimitMessage = formatAuthRateLimitMessage(authRateLimitStatus);
+
+  const appendLog = (message, type = 'info') => {
+    setLogs((curr) => [{ id: Date.now() + Math.round(Math.random() * 1000), time: toItalianClockTime(new Date()), message, type }, ...curr].slice(0, 10));
+  };
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(LEGACY_SECURITY_ALARM_PIN_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const run = async () => {
+      const available = await deviceAuth.isBiometricAvailable();
+      setBiometricAvailable(Boolean(available));
+      setBiometricStatus(
+        available
+          ? deviceAuth.isEnrolled
+            ? 'Passkey dispositivo configurata.'
+            : 'Conferma dispositivo disponibile: crea una passkey in modalità Edit.'
+          : 'Conferma dispositivo non disponibile su questo browser/dispositivo.',
+      );
+      setBiometricAvailabilityResolved(true);
+    };
+    void run();
+  }, [deviceAuth]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || suppressBrowserNavigation) return undefined;
+    const syncFromLocation = () => {
+      setIsCameraDirectoryView(resolveSecurityCamerasFromLocation());
+      setIsSensorDirectoryView(resolveSecuritySensorsFromLocation());
+    };
+    syncFromLocation();
+    window.addEventListener('popstate', syncFromLocation);
+    window.addEventListener('hashchange', syncFromLocation);
+    return () => {
+      window.removeEventListener('popstate', syncFromLocation);
+      window.removeEventListener('hashchange', syncFromLocation);
+    };
+  }, [suppressBrowserNavigation]);
+
+  useEffect(() => {
+    if (!suppressBrowserNavigation || !navigationRoute) return;
+    setIsCameraDirectoryView(isSecurityCamerasNavigationTarget(navigationRoute));
+    setIsSensorDirectoryView(isSecuritySensorsNavigationTarget(navigationRoute));
+  }, [navigationRoute, suppressBrowserNavigation]);
+
+  useEffect(() => {
+    if (availableAlarmEntities.length > 0) {
+      setSelectedAlarmEntityId((curr) => (curr && availableAlarmEntities.includes(curr) ? curr : availableAlarmEntities[0]));
+    }
+  }, [availableAlarmEntities]);
+
+  useEffect(() => {
+    if (!effectiveSecurityEditMode) {
+      setIsSensorSelectorOpen(false);
+      setIsCameraSelectorOpen(false);
+    }
+  }, [effectiveSecurityEditMode]);
+
+  useEffect(() => {
+    if (canManageSecurity) return;
+    setIsMobileSecurityEditMode(false);
+    setIsSensorSelectorOpen(false);
+    setIsCameraSelectorOpen(false);
+  }, [canManageSecurity]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (selectedAlarmEntityId) window.localStorage.setItem(STORAGE_KEYS.alarmEntityId, selectedAlarmEntityId);
+      else window.localStorage.removeItem(STORAGE_KEYS.alarmEntityId);
+    }
+  }, [selectedAlarmEntityId]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && visibleSensorEntityIds !== null) {
+      writeStoredEntitySelection(STORAGE_KEYS.visibleSensorEntityIds, visibleSensorEntityIds);
+    }
+  }, [visibleSensorEntityIds]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && visibleCameraEntityIds !== null) {
+      writeStoredEntitySelection(STORAGE_KEYS.visibleCameraEntityIds, visibleCameraEntityIds);
+    }
+  }, [visibleCameraEntityIds]);
+
+  useEffect(() => {
+    if (!armingDelayEndAtMs || typeof window === 'undefined') return undefined;
+    setArmingDelayNowMs(Date.now());
+    const id = window.setInterval(() => setArmingDelayNowMs(Date.now()), 200);
+    return () => window.clearInterval(id);
+  }, [armingDelayEndAtMs]);
+
+  useEffect(() => {
+    if (!armingDelayEndAtMs || remainingDelayMs > 0) return;
+    setArmingDelayEndAtMs(null);
+    setArmingDelayTotalMs(0);
+    setArmingDelayNowMs(Date.now());
+    setArmingTargetState(null);
+  }, [armingDelayEndAtMs, remainingDelayMs, haConnected, armingTargetState]);
+
+  useEffect(() => {
+    if (!haConnected || !activeAlarmEntity || !['pending', 'arming'].includes(normalizedLiveAlarmState) || armingDelayEndAtMs) return;
+    const secs = resolveAlarmExitDelaySeconds(activeAlarmEntity.rawAttributes);
+    if (!secs) return;
+    const now = Date.now();
+    const totalMs = Math.max(1000, secs * 1000);
+    setArmingDelayTotalMs(totalMs);
+    setArmingDelayEndAtMs(now + totalMs);
+    setArmingDelayNowMs(now);
+  }, [haConnected, activeAlarmEntity, normalizedLiveAlarmState, armingDelayEndAtMs]);
+
+  useEffect(() => {
+    if (!haConnected || !activeAlarmEntity || isLiveAlarmTransitioning || (!armingDelayEndAtMs && !armingDelayTotalMs)) return;
+    if (armingTargetState && mapAlarmStateForShield(normalizedLiveAlarmState, 'unavailable') !== armingTargetState) return;
+    setArmingDelayEndAtMs(null);
+    setArmingDelayTotalMs(0);
+    setArmingDelayNowMs(Date.now());
+    setArmingTargetState(null);
+  }, [haConnected, activeAlarmEntity, isLiveAlarmTransitioning, armingDelayEndAtMs, armingDelayTotalMs, armingTargetState, normalizedLiveAlarmState]);
+
+  useEffect(() => {
+    if (!pendingCommand) return undefined;
+    if (normalizedLiveAlarmState === pendingCommand.targetState) {
+      setPendingCommand(null);
+      setCommandFeedback(`Stato confermato: ${getAlarmStateLabel(pendingCommand.targetState)}.`);
+      setLogs((curr) => [
+        {
+          id: Date.now() + Math.round(Math.random() * 1000),
+          time: toItalianClockTime(new Date()),
+          message: `${getAlarmStateLabel(pendingCommand.targetState)} confermato da Home Assistant`,
+          type: 'success',
+        },
+        ...curr,
+      ].slice(0, 10));
+      return undefined;
+    }
+    if (['pending', 'arming', 'disarming'].includes(normalizedLiveAlarmState)) {
+      setPendingCommand(null);
+      setCommandFeedback('Transizione confermata da Home Assistant.');
+      return undefined;
+    }
+
+    const remainingMs = Math.max(0, pendingCommand.expiresAt - Date.now());
+    const timeoutId = window.setTimeout(() => {
+      setPendingCommand(null);
+      setCommandFeedback('Home Assistant non ha confermato il nuovo stato. Controlla il sistema prima di riprovare.');
+      setLogs((curr) => [
+        {
+          id: Date.now() + Math.round(Math.random() * 1000),
+          time: toItalianClockTime(new Date()),
+          message: 'Stato allarme non confermato',
+          type: 'warning',
+        },
+        ...curr,
+      ].slice(0, 10));
+    }, remainingMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [normalizedLiveAlarmState, pendingCommand]);
+
+  useEffect(() => {
+    if (alarmEntityAvailable) {
+      setCommandFeedback((current) => current.startsWith('Controlli non disponibili') ? '' : current);
+      return;
+    }
+    authSessionActiveRef.current = false;
+    setPendingCommand(null);
+    setDangerActionState(null);
+    setIsAuthModalOpen(false);
+    setPendingAlarmState(null);
+    setAuthPinInput('');
+    setAuthError('');
+    setIsAuthBusy(false);
+    if (runtimeMode === 'real') {
+      setCommandFeedback('Controlli non disponibili finché Home Assistant non è connesso.');
+    }
+  }, [alarmEntityAvailable, runtimeMode]);
+
+  useEffect(() => {
+    if (!commandFeedback.startsWith('Stato confermato:') && !commandFeedback.startsWith('Transizione confermata')) return undefined;
+    const timeoutId = window.setTimeout(() => setCommandFeedback(''), 2800);
+    return () => window.clearTimeout(timeoutId);
+  }, [commandFeedback]);
+
+  const closeAuthModal = () => {
+    if (!isAuthBusy) {
+      authSessionActiveRef.current = false;
+      setIsAuthModalOpen(false);
+      setPendingAlarmState(null);
+      setAuthPinInput('');
+      setAuthError('');
+    }
+  };
+  const applyAlarmState = async (nextState, authCode) => {
+    const service = ALARM_SERVICE_BY_STATE[nextState];
+    if (!service) return false;
+
+    const commandContext = alarmCommandContextRef.current;
+    if (!commandContext.available || commandContext.entityId !== selectedAlarmEntityId) {
+      setAuthError('Comando non autorizzato o non completato.');
+      setCommandFeedback('Controlli non disponibili finché Home Assistant non è connesso.');
+      return false;
+    }
+
+    const requiresCode = isAlarmCodeRequiredForState(nextState, activeAlarmAttributes);
+    const cleanedCode = sanitizeAlarmCode(authCode, alarmCodeFormat);
+    if (requiresCode && !cleanedCode) {
+      setAuthError(`${alarmCodeTypeLabel} richiesto dall’entità Home Assistant selezionata.`);
+      return false;
+    }
+
+    const payload = { entity_id: selectedAlarmEntityId };
+    if (requiresCode && cleanedCode) payload.code = cleanedCode;
+    const ok = await onCallService('alarm_control_panel', service, payload);
+    if (!ok) {
+      setAuthError('Comando non autorizzato o non completato.');
+      setCommandFeedback('Comando non autorizzato o non completato.');
+      appendLog('Cambio stato allarme non riuscito', 'warning');
+      appendSecurityAuditEvent({
+        tone: 'warning',
+        message: `Comando allarme rifiutato: ${getAlarmStateLabel(nextState)}.`,
+        context: selectedAlarmEntityId || 'Security Dashboard',
+      });
+      return false;
+    }
+
+    const now = Date.now();
+    setPendingCommand({ id: `${now}-${nextState}`, targetState: nextState, expiresAt: now + 20000 });
+    setCommandFeedback(`Comando inviato. In attesa della conferma di Home Assistant…`);
+    if (nextState !== 'disarmed' && nextState !== 'triggered') setArmingTargetState(nextState);
+    appendLog(`Comando inviato: ${getAlarmStateLabel(nextState)}`, 'info');
+
+    appendSecurityAuditEvent({
+      tone: 'success',
+      message: `Comando allarme autorizzato: ${getAlarmStateLabel(nextState)}.`,
+      context: selectedAlarmEntityId || 'Security Dashboard',
+    });
+    setIsAuthModalOpen(false);
+    authSessionActiveRef.current = false;
+    setPendingAlarmState(null);
+    setAuthPinInput('');
+    setAuthError('');
+    return true;
+  };
+
+  const beginAlarmStateChange = (nextState) => {
+    if (!alarmCommandsAvailable) {
+      setCommandFeedback('Controlli non disponibili finché Home Assistant non è connesso.');
+      return;
+    }
+    if (isAlarmTransitioning) {
+      appendLog('Cambio stato in corso: attendi il completamento.', 'info');
+      return;
+    }
+    if (nextState === resolvedShieldState || isAuthBusy) return;
+
+    const securityRequirement = resolveAlarmSecurityRequirement({
+      action: resolveAlarmActionKind(nextState),
+      codeArmRequired: alarmCodeArmRequired,
+      codeFormat: alarmCodeFormat,
+      storedHaPinConfigured: storedAlarmCode.length > 0,
+      localExtraPinConfigured: localExtraCode.length > 0,
+      deviceAuthEnabled: requireDeviceConfirmation,
+    });
+    if (securityRequirement.allowsDeviceAuth && !biometricAvailabilityResolved) {
+      setCommandFeedback('Verifica della conferma dispositivo in corso. Riprova tra un istante.');
+      return;
+    }
+    if (securityRequirement.allowsDeviceAuth && (!biometricAvailable || !deviceAuth.isEnrolled) && !securityRequirement.needsCodeInput) {
+      appendLog('Conferma dispositivo non disponibile e nessun PIN fallback configurato.', 'warning');
+      setCommandFeedback('Conferma dispositivo non disponibile. Configura una passkey dalla card Alarm.');
+      return;
+    }
+
+    if (!securityRequirement.needsCodeInput && !securityRequirement.allowsDeviceAuth) {
+      setIsAuthBusy(true);
+      void (async () => {
+        try {
+          await applyAlarmState(nextState);
+        } finally {
+          setIsAuthBusy(false);
+        }
+      })();
+      return;
+    }
+
+    setPendingAlarmState(nextState);
+    setAuthPinInput('');
+    setAuthError('');
+    authSessionActiveRef.current = true;
+    setIsAuthModalOpen(true);
+  };
+
+  const requestAlarmStateChange = (nextState) => {
+    if (nextState === 'triggered') {
+      setDangerActionState(nextState);
+      return;
+    }
+    beginAlarmStateChange(nextState);
+  };
+
+  const confirmPendingDeviceAuth = async () => {
+    if (!pendingAlarmState || !pendingSecurityRequirement?.allowsDeviceAuth) return false;
+    const authEntityId = selectedAlarmEntityId;
+    const verified = await deviceAuth.authenticate(`Security Dashboard ${getAlarmStateLabel(pendingAlarmState)}`);
+    if (!authSessionActiveRef.current || alarmCommandContextRef.current.entityId !== authEntityId) return false;
+    if (!verified) {
+      appendSecurityAuditEvent({
+        tone: 'warning',
+        message: `Verifica dispositivo allarme non riuscita: ${getAlarmStateLabel(pendingAlarmState)}.`,
+        context: selectedAlarmEntityId || 'Security Dashboard',
+      });
+      return false;
+    }
+    if (pendingSecurityRequirement.needsCodeInput && !storedAlarmCode) return false;
+
+    setIsAuthBusy(true);
+    try {
+      appendSecurityAuditEvent({
+        tone: 'success',
+        message: 'Comando allarme autorizzato con conferma dispositivo.',
+        context: selectedAlarmEntityId || 'Security Dashboard',
+      });
+      return await applyAlarmState(
+        pendingAlarmState,
+        pendingSecurityRequirement.needsHaCode ? storedAlarmCode : undefined,
+      );
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
+  const verifyWithPin = async () => {
+    if (!pendingAlarmState) return;
+
+    if (pendingAuthRequiresCode) {
+      const rateLimitStatus = getAuthRateLimitStatus(authAttemptState);
+      if (rateLimitStatus.isLocked) {
+        setAuthError(formatAuthRateLimitMessage(rateLimitStatus));
+        appendSecurityAuditEvent({
+          tone: 'warning',
+          message: 'Fallback PIN locale bloccato temporaneamente.',
+          context: selectedAlarmEntityId || 'Security Dashboard',
+        });
+        return;
+      }
+      const cleanedInput = sanitizeAlarmCode(authPinInput, alarmCodeFormat);
+      if (cleanedInput.length === 0) {
+        setAuthError(`Inserisci ${alarmCodeTypeLabel.toLowerCase()} di sicurezza.`);
+        return;
+      }
+      const manualSubmission = resolveAlarmManualCodeSubmission({
+        inputCode: cleanedInput,
+        localExtraCode,
+        storedHaCode: storedAlarmCode,
+        requiresCode: pendingAuthRequiresCode,
+      });
+      if (!manualSubmission.ok) {
+        const nextAttemptState = recordAuthFailure(authAttemptState);
+        const nextRateLimitStatus = getAuthRateLimitStatus(nextAttemptState);
+        setAuthAttemptState(nextAttemptState);
+        setAuthError(
+          nextRateLimitStatus.isLocked
+            ? formatAuthRateLimitMessage(nextRateLimitStatus)
+            : 'Comando non autorizzato o non completato.',
+        );
+        appendLog('Conferma comando non riuscita', 'warning');
+        appendSecurityAuditEvent({
+          tone: 'warning',
+          message: 'Conferma locale comando non riuscita.',
+          context: selectedAlarmEntityId || 'Security Dashboard',
+        });
+        return;
+      }
+      setAuthAttemptState(recordAuthSuccess());
+      appendSecurityAuditEvent({
+        tone: 'success',
+        message: 'Fallback PIN/codice locale verificato.',
+        context: selectedAlarmEntityId || 'Security Dashboard',
+      });
+      setIsAuthBusy(true);
+      try {
+        const didApply = await applyAlarmState(
+          pendingAlarmState,
+          pendingStateRequiresCode && manualSubmission.ok ? manualSubmission.haCode : undefined,
+        );
+        if (!didApply) {
+          const nextAttemptState = recordAuthFailure(authAttemptState);
+          setAuthAttemptState(nextAttemptState);
+          setAuthError(
+            getAuthRateLimitStatus(nextAttemptState).isLocked
+              ? formatAuthRateLimitMessage(getAuthRateLimitStatus(nextAttemptState))
+              : 'Comando non autorizzato o non completato.',
+          );
+        }
+      } finally {
+        setIsAuthBusy(false);
+      }
+      return;
+    }
+
+    setIsAuthBusy(true);
+    try {
+      await applyAlarmState(pendingAlarmState);
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
+  const enrollBiometric = async () => {
+    if (!effectiveSecurityEditMode || !canManageSecurity) return;
+    if (!biometricAvailable) {
+      setBiometricMessage('Conferma dispositivo non disponibile.');
+      return;
+    }
+
+    setIsBiometricBusy(true);
+    setBiometricMessage('');
+    try {
+      const wasEnrolled = deviceAuth.isEnrolled;
+      const verified = await deviceAuth.verifyOrEnroll('Configurazione Security Dashboard');
+      if (!verified) throw new Error('Verifica dispositivo annullata.');
+      setBiometricMessage(wasEnrolled ? 'Conferma dispositivo completata.' : 'Passkey dispositivo creata.');
+      appendLog(wasEnrolled ? 'Biometria dispositivo verificata' : 'Passkey dispositivo creata', 'success');
+      appendSecurityAuditEvent({
+        tone: 'success',
+        message: wasEnrolled ? 'Passkey dispositivo verificata dalla Security Dashboard.' : 'Passkey dispositivo creata dalla Security Dashboard.',
+        context: selectedAlarmEntityId || 'Security Dashboard',
+      });
+    } catch {
+      setBiometricMessage('Conferma dispositivo annullata o non riuscita.');
+      appendSecurityAuditEvent({
+        tone: 'warning',
+        message: 'Configurazione passkey dispositivo non riuscita o annullata.',
+        context: selectedAlarmEntityId || 'Security Dashboard',
+      });
+    } finally {
+      setIsBiometricBusy(false);
+    }
+  };
+
+  const pushPinDigit = (digit) => {
+    if (!isAlarmCodeNumeric) return;
+    if (authPinInput.length >= 8) return;
+    setAuthPinInput((curr) => `${curr}${digit}`.slice(0, 8));
+  };
+
+  const popPinDigit = () => setAuthPinInput((curr) => curr.slice(0, -1));
+  const clearPin = () => setAuthPinInput('');
+
+  const defaultArmTarget = supportedAlarmModes.find((option) => option.value === 'armed_away')?.value ?? supportedAlarmModes[0]?.value;
+  const primaryShieldActionTarget = resolvedShieldState === 'disarmed' ? defaultArmTarget : 'disarmed';
+  const primaryShieldActionLabel = primaryShieldActionTarget === 'disarmed'
+    ? 'Disinserire'
+    : primaryShieldActionTarget
+      ? `Inserire ${supportedAlarmModes.find((option) => option.value === primaryShieldActionTarget)?.label ?? ''}`.trim()
+      : 'Nessuna modalità disponibile';
+
+  const toggleVisibleSensorEntity = (entityId) => {
+    if (!effectiveSecurityEditMode || !canManageSecurity) return;
+    setVisibleSensorEntityIds((curr) => {
+      const base = curr === null ? availableSecuritySensorEntities : curr;
+      const exists = base.includes(entityId);
+      if (exists) return base.filter((id) => id !== entityId);
+      return [...base, entityId];
+    });
+  };
+
+  const toggleVisibleCameraEntity = (entityId) => {
+    if (!effectiveSecurityEditMode || !canManageSecurity) return;
+    setVisibleCameraEntityIds((curr) => {
+      const base = curr === null ? availableCameraEntities : curr;
+      const exists = base.includes(entityId);
+      if (exists) return base.filter((id) => id !== entityId);
+      return [...base, entityId];
+    });
+  };
+
+  const selectAllSensors = () => {
+    if (effectiveSecurityEditMode && canManageSecurity) setVisibleSensorEntityIds([...availableSecuritySensorEntities]);
+  };
+
+  const selectNoSensors = () => {
+    if (effectiveSecurityEditMode && canManageSecurity) setVisibleSensorEntityIds([]);
+  };
+  const selectAllCameras = () => {
+    if (effectiveSecurityEditMode && canManageSecurity) setVisibleCameraEntityIds([...availableCameraEntities]);
+  };
+  const selectNoCameras = () => {
+    if (effectiveSecurityEditMode && canManageSecurity) setVisibleCameraEntityIds([]);
+  };
+
+  const navigateSecurityPage = (targetPath) => {
+    const normalizedTarget = `${targetPath}`.trim();
+    if (!normalizedTarget) return;
+    if (suppressBrowserNavigation || typeof window === 'undefined') {
+      setIsCameraDirectoryView(isSecurityCamerasNavigationTarget(normalizedTarget));
+      setIsSensorDirectoryView(isSecuritySensorsNavigationTarget(normalizedTarget));
+      return;
+    }
+    const currentRoute = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (currentRoute !== normalizedTarget) {
+      window.history.pushState({}, '', normalizedTarget);
+    }
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    setIsCameraDirectoryView(isSecurityCamerasNavigationTarget(normalizedTarget));
+    setIsSensorDirectoryView(isSecuritySensorsNavigationTarget(normalizedTarget));
+  };
+
+  const openAllCamerasPage = () => {
+    if (effectiveSecurityEditMode) return;
+    navigateSecurityPage(SECURITY_CAMERAS_PATH);
+  };
+  const openAllSensorsPage = () => {
+    if (effectiveSecurityEditMode) return;
+    navigateSecurityPage(SECURITY_SENSORS_PATH);
+  };
+  const openSecurityOverviewPage = () => navigateSecurityPage(SECURITY_OVERVIEW_PATH);
+  const isSecurityDirectoryView = isCameraDirectoryView || isSensorDirectoryView;
+
+  return (
+    <div ref={isSecurityDirectoryView ? securityDirectoryScrollRef : undefined} className={isSecurityDirectoryView ? 'h-full w-full overflow-y-auto p-0' : 'dashboard-page-scroll'}>
+      {!isSecurityDirectoryView ? (
+        <header className="dashboard-page-content-wide">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h1 className="dashboard-page-title">Sicurezza</h1>
+              <p className="dashboard-page-subtitle">Controllo perimetrale e videosorveglianza</p>
+            </div>
+            {canManageSecurity && !isEditMode ? (
+              <button
+                type="button"
+                aria-label={isMobileSecurityEditMode ? 'Termina modifica sicurezza' : 'Modifica sicurezza'}
+                aria-pressed={isMobileSecurityEditMode}
+                onClick={() => setIsMobileSecurityEditMode((current) => !current)}
+                className="liquid-glass-control inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[color:var(--ui-text-primary)] md:hidden"
+              >
+                {isMobileSecurityEditMode ? <Check className="h-4 w-4" /> : <Pencil className="h-4 w-4" />}
+              </button>
+            ) : null}
+          </div>
+        </header>
+      ) : null}
+
+      {isCameraDirectoryView ? (
+        <div className="h-full">
+          <SecurityCameraSection
+            cameras={cameras}
+            isDedicatedPage
+            isEditMode={effectiveSecurityEditMode}
+            selectedCount={selectedCameraEntityIds.length}
+            totalCount={availableCameraEntities.length}
+            onOpenSelector={() => setIsCameraSelectorOpen(true)}
+            onBackToOverview={openSecurityOverviewPage}
+            onOpenCamera={setActiveCameraEntityId}
+            scrollContainerRef={securityDirectoryScrollRef}
+          />
+        </div>
+      ) : isSensorDirectoryView ? (
+        <div className="h-full">
+          <SecuritySensorDirectoryPage
+            sensors={filteredSensors}
+            query={sensorSearchQuery}
+            onQueryChange={setSensorSearchQuery}
+            onBackToOverview={openSecurityOverviewPage}
+            scrollContainerRef={securityDirectoryScrollRef}
+          />
+        </div>
+      ) : (
+        <div className="dashboard-page-content-wide mt-4 space-y-4 sm:mt-6 sm:space-y-6">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] items-start gap-4 sm:gap-6">
+            {!effectiveSecurityEditMode ? (
+              <SecurityMainShield
+                visual={currentVisual}
+                statusLabel={alarmStatusLabel}
+                isTransitioning={isAlarmTransitioning}
+                showDelayProgress={hasActiveArmingDelay}
+                delayProgress={delayProgress}
+                delayRemainingSeconds={delayRemainingSeconds}
+                onPrimaryAction={() => primaryShieldActionTarget && requestAlarmStateChange(primaryShieldActionTarget)}
+                primaryActionLabel={primaryShieldActionLabel}
+                activeState={resolvedShieldState}
+                onActionChange={requestAlarmStateChange}
+                alarmOptions={alarmOptions}
+                disabled={!alarmCommandsAvailable || isAlarmTransitioning || !primaryShieldActionTarget}
+                commandFeedback={commandFeedback}
+              />
+            ) : (
+              <section className="dashboard-content-surface rounded-[26px] p-4 sm:rounded-[32px] sm:p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-[11px] font-light uppercase tracking-[0.28em] text-[color:var(--ui-text-tertiary)]">Config</p>
+                    <h2 className="mt-2 text-xl font-semibold text-[color:var(--ui-text-primary)]">Impostazioni Sicurezza</h2>
+                  </div>
+                  <span className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)]"><Settings className="h-4 w-4 text-[color:var(--ui-text-secondary)]" /></span>
+                </div>
+
+                <div className="mt-5 space-y-4">
+                  <label className="block">
+                    <span className="text-xs font-light uppercase tracking-[0.16em] text-[color:var(--ui-text-tertiary)]">Entità allarme</span>
+                    <GlassDropdown
+                      className="mt-2"
+                      options={alarmDropdownOptions}
+                      selected={alarmDropdownOptions.find((option) => option.id === selectedAlarmEntityId) ?? null}
+                      onChange={(option) => {
+                        if (effectiveSecurityEditMode && canManageSecurity) setSelectedAlarmEntityId(option.id);
+                      }}
+                      placeholder="Nessuna entità alarm_control_panel trovata"
+                      disabled={alarmDropdownOptions.length === 0}
+                    />
+                  </label>
+
+                  <div className="dashboard-content-surface-soft rounded-2xl p-3">
+                    <p className="text-sm font-semibold text-[color:var(--ui-text-primary)]">Configurazione comandi</p>
+                    <p className="mt-1 text-xs leading-relaxed text-[color:var(--ui-text-secondary)]">
+                      {activeAlarmSecurityProfile
+                        ? 'Questa entità usa la configurazione della card Alarm collegata. I codici si gestiscono esclusivamente dal Builder della card.'
+                        : alarmHasCodeCapability
+                          ? `Home Assistant richiede ${alarmCodeTypeLabel.toLowerCase()}: verrà richiesto solo al momento del comando.`
+                          : 'Nessun codice locale separato. L’autorizzazione resta quella dell’entità Home Assistant.'}
+                    </p>
+                  </div>
+
+                  <div className="dashboard-content-surface-soft rounded-2xl p-3">
+                    <p className="text-sm font-semibold text-[color:var(--ui-text-primary)]">Conferma dispositivo</p>
+                    <p className="mt-1 text-xs text-[color:var(--ui-text-secondary)]">{biometricStatus}</p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button type="button" onClick={enrollBiometric} disabled={isBiometricBusy || !biometricAvailable} className="glass-button min-h-11 rounded-xl px-3 text-xs font-semibold">
+                        {isBiometricBusy ? (deviceAuth.isEnrolled ? 'Verifica...' : 'Creazione...') : deviceAuth.isEnrolled ? 'Verifica dispositivo' : 'Crea passkey'}
+                      </button>
+                    </div>
+                    {biometricMessage ? <p className="mt-2 inline-flex items-center gap-1 text-xs text-emerald-200/90"><Check className="h-3.5 w-3.5" />{biometricMessage}</p> : null}
+                  </div>
+                </div>
+              </section>
+            )}
+
+            <SecurityCameraSection
+              cameras={cameras}
+              previewLimit={MAX_CAMERAS_ON_DASHBOARD}
+              isEditMode={effectiveSecurityEditMode}
+              selectedCount={selectedCameraEntityIds.length}
+              totalCount={availableCameraEntities.length}
+              onOpenSelector={() => setIsCameraSelectorOpen(true)}
+              onOpenAll={openAllCamerasPage}
+              onOpenCamera={setActiveCameraEntityId}
+            />
+          </div>
+
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] items-start gap-4 sm:gap-6">
+            <SecuritySensorList
+              sensors={filteredSensors}
+              query={sensorSearchQuery}
+              onQueryChange={setSensorSearchQuery}
+              isEditMode={effectiveSecurityEditMode}
+              selectedCount={selectedSensorEntityIds.length}
+              totalCount={availableSecuritySensorEntities.length}
+              onOpenSelector={() => setIsSensorSelectorOpen(true)}
+              onOpenAll={openAllSensorsPage}
+            />
+
+            {UI_FLAGS.showEventFeed ? (
+              <section className="dashboard-content-surface rounded-[26px] p-4 sm:rounded-[32px] sm:p-6">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-light uppercase tracking-[0.28em] text-[color:var(--ui-text-tertiary)]">Eventi Recenti</p>
+                    <h3 className="mt-2 text-xl font-semibold text-[color:var(--ui-text-primary)]">Log Sicurezza</h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {runtimeMode === 'demo' ? (
+                      <span className="inline-flex h-8 items-center rounded-full border border-[color:var(--ui-border)] bg-[color:var(--ui-fill-tertiary)] px-3 text-[10px] font-semibold uppercase tracking-[0.14em] text-[color:var(--ui-text-secondary)]">
+                        Dati demo
+                      </span>
+                    ) : null}
+                  {triggerSupported ? (
+                    <button
+                      type="button"
+                      onClick={() => requestAlarmStateChange('triggered')}
+                      disabled={!alarmCommandsAvailable || isAlarmTransitioning}
+                      className="inline-flex min-h-11 items-center gap-2 rounded-full border border-[color:color-mix(in_srgb,var(--ui-danger)_48%,transparent)] bg-[color:color-mix(in_srgb,var(--ui-danger)_14%,transparent)] px-3 text-xs font-semibold text-[color:var(--ui-danger)] transition hover:bg-[color:color-mix(in_srgb,var(--ui-danger)_20%,transparent)] disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                      <AlertTriangle className="h-3.5 w-3.5" />SOS
+                    </button>
+                  ) : null}
+                  </div>
+                </div>
+                <ul className="mt-4 space-y-2">
+                  {logs.map((log) => (
+                    <li key={log.id} className="dashboard-content-surface-soft rounded-2xl px-3 py-2.5">
+                      <div className="flex items-start justify-between gap-2">
+                        <p className={cn('text-xs font-semibold uppercase tracking-[0.14em]', log.type === 'warning' ? 'text-[color:var(--ui-warning)]' : log.type === 'success' ? 'text-[color:var(--ui-success)]' : 'text-[color:var(--ui-info)]')}>
+                          {log.message}
+                        </p>
+                        <span className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-[color:var(--ui-text-tertiary)]"><Clock3 className="h-3.5 w-3.5" />{log.time}</span>
+                      </div>
+                    </li>
+                  ))}
+                  {logs.length === 0 ? (
+                    <li className="dashboard-content-surface-soft rounded-2xl px-4 py-5 text-center text-xs text-[color:var(--ui-text-tertiary)]">
+                      Nessun evento registrato in questa sessione.
+                    </li>
+                  ) : null}
+                </ul>
+              </section>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      <SecurityEntityPickerModal
+        isOpen={effectiveSecurityEditMode && isSensorSelectorOpen}
+        title="Sensori di Sicurezza"
+        description="Seleziona i sensori perimetrali/sicurezza da mostrare nel box."
+        entities={sensorSelectionOptions}
+        selectedEntityIds={selectedSensorEntityIds}
+        onToggleEntity={toggleVisibleSensorEntity}
+        onSelectAll={selectAllSensors}
+        onSelectNone={selectNoSensors}
+        onClose={() => setIsSensorSelectorOpen(false)}
+      />
+
+      <SecurityEntityPickerModal
+        isOpen={effectiveSecurityEditMode && isCameraSelectorOpen}
+        title="Telecamere di Sicurezza"
+        description="Seleziona le telecamere da mostrare nella dashboard Security."
+        entities={cameraSelectionOptions}
+        selectedEntityIds={selectedCameraEntityIds}
+        onToggleEntity={toggleVisibleCameraEntity}
+        onSelectAll={selectAllCameras}
+        onSelectNone={selectNoCameras}
+        onClose={() => setIsCameraSelectorOpen(false)}
+      />
+
+      <CameraViewer
+        isOpen={Boolean(activeCamera)}
+        cameras={cameras.map((camera) => camera.viewerItem)}
+        activeEntityId={activeCameraEntityId}
+        onActiveEntityChange={setActiveCameraEntityId}
+        onClose={() => setActiveCameraEntityId(null)}
+        commandsEnabled={!effectiveSecurityEditMode && haConnected}
+        onPtzMove={onCameraPtzMove}
+        onPtzStop={onCameraPtzStop}
+      />
+
+      <SecurityAuthModal
+        isOpen={isAuthModalOpen}
+        pendingAlarmState={pendingAlarmState}
+        pendingStateRequiresCode={pendingAuthRequiresCode}
+        title={pendingSecurityRequirement?.title}
+        description={
+          pendingPrefersDeviceAuth
+            ? 'Conferma questa azione sul dispositivo per continuare.'
+            : localExtraCode && pendingAuthRequiresCode
+              ? 'Inserisci PIN allarme + codice extra locale.'
+              : pendingSecurityRequirement?.description
+        }
+        authError={authError || authRateLimitMessage}
+        isAuthBusy={isAuthBusy}
+        isAlarmCodeNumeric={isAlarmCodeNumeric}
+        alarmCodeTypeLabel={localExtraCode ? 'PIN allarme + extra' : alarmCodeTypeLabel}
+        authPinInput={authPinInput}
+        preferDeviceAuth={pendingPrefersDeviceAuth}
+        deviceAuthLabel="Conferma dispositivo"
+        onVerifyWithDevice={pendingPrefersDeviceAuth ? confirmPendingDeviceAuth : undefined}
+        onPinInputChange={(value) => setAuthPinInput(sanitizeAlarmCode(value, alarmCodeFormat))}
+        onVerifyWithPin={verifyWithPin}
+        onPushPinDigit={pushPinDigit}
+        onPopPinDigit={popPinDigit}
+        onClearPin={clearPin}
+        onClose={closeAuthModal}
+      />
+
+      <GlassModal
+        isOpen={dangerActionState === 'triggered'}
+        onClose={() => setDangerActionState(null)}
+        title="Attivare SOS emergenza?"
+        eyebrow="Azione critica"
+        description="Il comando attiverà realmente l’allarme configurato in Home Assistant. Prosegui solo in caso di emergenza."
+        size="sm"
+        dismissible={!isAuthBusy}
+        footer={
+          <div className="grid w-full grid-cols-2 gap-2">
+            <button type="button" onClick={() => setDangerActionState(null)} className="glass-button min-h-11 rounded-full px-4 text-sm font-semibold">
+              Annulla
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const action = dangerActionState;
+                setDangerActionState(null);
+                if (action) beginAlarmStateChange(action);
+              }}
+              className="min-h-11 rounded-full border border-[color:color-mix(in_srgb,var(--ui-danger)_52%,transparent)] bg-[color:color-mix(in_srgb,var(--ui-danger)_18%,transparent)] px-4 text-sm font-semibold text-[color:var(--ui-danger)]"
+            >
+              Attiva SOS
+            </button>
+          </div>
+        }
+      />
+    </div>
+  );
+}
+
+export default SecurityDashboard;

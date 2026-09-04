@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+release-artifacts/
+coverage/
+test-results/
+tmp/
+.tmp_behance/
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+.env*
